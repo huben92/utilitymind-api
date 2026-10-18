@@ -1,0 +1,3 @@
+-r requirements-operations.txt
+-r requirements-markdown.txt
+waitress==3.0.2

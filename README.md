@@ -29,6 +29,7 @@ The [Compose file](compose.yaml) starts Flask, PostgreSQL, ClickHouse, and Mosqu
 - [Architecture](docs/architecture.md): data flow and boundaries.
 - [API reference](docs/api-reference.md): local HTTP endpoints and MQTT payloads.
 - [Manufacturing audit](docs/wheel-manufacturing-audit.md): synthetic scenario assumptions.
+- [Cloud deployment](docs/cloud-deployment.md): Firebase, Cloud Run, VM, cost, and operations.
 
 The Flask entry point is `operations_app.py`. Other modules handle authentication, AI chat, chart ranges, reporting, alerts, and historical baselines. `seed_historical_data.py` adds the optional three-month synthetic demonstration history without changing configured baselines or operational maximums:
 

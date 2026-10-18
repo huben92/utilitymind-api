@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wheelworks
+      POSTGRES_USER: wheelworks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wheelworks -d wheelworks"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_DB: wheelworks
+      CLICKHOUSE_USER: wheelworks
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    volumes:
+      - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile.cloud
+    environment:
+      DATABASE_URL: postgresql://wheelworks:${POSTGRES_PASSWORD}@postgres:5432/wheelworks
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: wheelworks
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      MQTT_HOST: mqtt
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: factory/wheel-rim/#
+      SIMULATOR_MODE: external
+      SESSION_COOKIE_SECURE: "1"
+      AI_KEY_FILE: /workspace/data/ai_settings.key
+    volumes:
+      - ./data:/workspace/data
+    ports:
+      - "8765:8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    restart: unless-stopped
+
+  simulator:
+    build:
+      context: ..
+      dockerfile: simulator/Dockerfile
+    environment:
+      DASHBOARD_URL: http://dashboard:8765
+      SIMULATOR_BIND_HOST: 0.0.0.0
+      SIMULATOR_MQTT_HOST: mqtt
+      SIMULATOR_MQTT_PORT: "1883"
+      SIMULATOR_SERVICE_KEY_FILE: /workspace/api/data/simulator_service.key
+      SENSOR_DB: /workspace/simulator/data/sensors.sqlite3
+    volumes:
+      - ./data:/workspace/api/data:ro
+      - simulator_data:/workspace/simulator/data
+    ports:
+      - "8766:8766"
+    depends_on:
+      - dashboard
+      - mqtt
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  simulator_data:
