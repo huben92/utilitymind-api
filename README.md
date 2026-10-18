@@ -38,3 +38,16 @@ docker compose -f compose.yaml exec -T dashboard python api/seed_historical_data
 ```
 
 The frontend is in [utilitymind-app](https://github.com/huben92/utilitymind-app); the MQTT publisher and slider UI are in [utilitymind-simulator](https://github.com/huben92/utilitymind-simulator).
+
+## Steel plate demonstration factory
+
+Run `python api/seed_steel_plate.py` in the dashboard container to create the
+Steel Plate Manufacturing factory, two locations, two lines, nine machines,
+and utility meters. It writes three months of explicitly synthetic readings
+and derives historical baselines. Completed runs are idempotent; partial runs
+are detected rather than duplicated. Configured baselines and maxima stay
+fixed. The simulator discovers the enabled meters automatically.
+
+The `factory_admin` role requires a `factory_id`. Its dashboard, charts,
+reports, alerts, and master-data mutations are scoped to that factory.
+Factory admins cannot access AI chat because its SQL tool spans factories.

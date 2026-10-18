@@ -11,7 +11,7 @@ import time
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
-ROLES = ("super_admin", "admin", "viewer")
+ROLES = ("super_admin", "admin", "factory_admin", "viewer")
 USERNAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{2,49}\Z")
 _ATTEMPTS = {}
 _ATTEMPTS_LOCK = threading.Lock()

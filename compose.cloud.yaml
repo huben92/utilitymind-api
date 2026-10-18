@@ -45,7 +45,7 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
       MQTT_HOST: mqtt
       MQTT_PORT: "1883"
-      MQTT_TOPIC: factory/wheel-rim/#
+      MQTT_TOPIC: factory/#
       SIMULATOR_MODE: external
       SESSION_COOKIE_SECURE: "1"
       SESSION_COOKIE_NAME: __session

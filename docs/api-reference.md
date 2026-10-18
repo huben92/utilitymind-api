@@ -14,6 +14,11 @@ The Flask dashboard listens at `http://127.0.0.1:8765`; the simulator listens at
 
 Every dashboard data endpoint except `/api/health`, login, and session lookup requires authentication. Mutating methods require the `X-CSRF-Token` header from the current session. Only super admins manage users and AI settings; viewers cannot change master data or notification state. The simulator's service token has access only to `GET /api/simulator-catalog` and the enabled-only `PUT /api/master/sensors` payload.
 
+`factory_admin` users require a `factory_id`. Dashboard catalog, alerts,
+reports, category and machine charts, and master-data operations are scoped
+to that factory, including direct ID requests. AI chat and simulator controls
+are unavailable to factory admins because those interfaces are global.
+
 ## Dashboard reads
 
 | Method | Path | Result |

@@ -12,11 +12,11 @@ cookie to Cloud Run, so the cloud Compose file gives Flask's cookie that name.
 ## Pilot resources and costs
 
 Project: `utilitymind-wheelworks`. Region: `us-central1`. VM:
-`utilitymind-data-1`, `e2-small`, 30 GB standard persistent boot disk. The VM
+`utilitymind-data-1`, `e2-medium`, 30 GB standard persistent boot disk. The VM
 has a private IP in `utilitymind-vpc` and an ephemeral external IPv4 address.
 Its firewall allows SSH only through Google Cloud IAP and app ports 8765/8766
-only from `10.90.0.0/24`. The `UtilityMind pilot Rp500k` billing budget sends
-alerts at 50%, 80%, and 100% of Rp500,000 per month. A budget is an alert, not
+only from `10.90.0.0/24`. The pilot billing budget sends
+alerts at 50%, 80%, and 100% of its configured monthly amount. A budget is an alert, not
 a hard spending cap. VM, disk, and IPv4 cost continue while the VM runs; Cloud
 Run, storage, build, egress, and taxes may add to the total.
 
@@ -31,6 +31,7 @@ bash deploy/setup-cloud-env.sh
 docker compose -f compose.cloud.yaml up -d --build
 docker compose -f compose.cloud.yaml exec -T dashboard python api/bootstrap_superadmin.py
 docker compose -f compose.cloud.yaml exec -T dashboard python api/seed_historical_data.py
+docker compose -f compose.cloud.yaml exec -T dashboard python api/seed_steel_plate.py
 ```
 
 The bootstrap command prints the initial password only once. Save it in a

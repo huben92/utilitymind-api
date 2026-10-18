@@ -13,7 +13,7 @@ import time
 import uuid
 
 import clickhouse_connect
-from flask import Flask, g, jsonify, request, send_file, send_from_directory, session
+from flask import Flask, g, has_request_context, jsonify, request, send_file, send_from_directory, session
 import paho.mqtt.client as mqtt
 import psycopg
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
@@ -48,7 +48,7 @@ CH_HOST = os.getenv("CLICKHOUSE_HOST", "localhost")
 CH_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123" if CH_HOST != "localhost" else "8124"))
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1884"))
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "factory/wheel-rim/#")
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "factory/#")
 SIM_INTERVAL = max(2, int(os.getenv("SIM_INTERVAL", "5")))
 CH_LOCK = threading.Lock()
 CH_CLIENT = None
@@ -68,7 +68,7 @@ def current_user():
     if not identity:
         return None
     with pg() as conn:
-        user = conn.execute("""SELECT id,username,role,enabled,session_version
+        user = conn.execute("""SELECT id,username,role,factory_id,enabled,session_version
             FROM app_users WHERE id=%s""", (identity,)).fetchone()
     if not user or not user["enabled"] or user["session_version"] != session.get("session_version"):
         session.clear()
@@ -77,7 +77,39 @@ def current_user():
 
 
 def public_user(user):
-    return {key: user[key] for key in ("id", "username", "role")}
+    return {key: user[key] for key in ("id", "username", "role", "factory_id")}
+
+
+def scoped_factory_id():
+    """Return the factory boundary for a signed-in factory administrator."""
+    if not has_request_context():
+        return None
+    user = getattr(g, "user", None)
+    return user["factory_id"] if user and user["role"] == "factory_admin" else None
+
+
+def machine_factory_id(conn, machine_id):
+    row = conn.execute("""SELECT l.factory_id FROM machines m
+        JOIN production_lines p ON p.id=m.production_line_id
+        JOIN locations l ON l.id=p.location_id WHERE m.id=%s""", (machine_id,)).fetchone()
+    return row["factory_id"] if row else None
+
+
+def record_factory_id(conn, table, identity):
+    queries = {
+        "factories": "SELECT id AS factory_id FROM factories WHERE id=%s",
+        "locations": "SELECT factory_id FROM locations WHERE id=%s",
+        "production_lines": "SELECT l.factory_id FROM production_lines p JOIN locations l ON l.id=p.location_id WHERE p.id=%s",
+        "machines": "SELECT l.factory_id FROM machines m JOIN production_lines p ON p.id=m.production_line_id JOIN locations l ON l.id=p.location_id WHERE m.id=%s",
+        "sensors": "SELECT l.factory_id FROM sensors s JOIN machines m ON m.id=s.machine_id JOIN production_lines p ON p.id=m.production_line_id JOIN locations l ON l.id=p.location_id WHERE s.id=%s",
+    }
+    row = conn.execute(queries[table], (identity,)).fetchone()
+    return row["factory_id"] if row else None
+
+
+def scoped_record_allowed(conn, table, identity):
+    boundary = scoped_factory_id()
+    return boundary is None or record_factory_id(conn, table, identity) == boundary
 
 
 @app.before_request
@@ -101,6 +133,9 @@ def auth_guard():
     if not user:
         return jsonify({"error": "Authentication required"}), 401
     g.user = user
+    if user["role"] == "factory_admin" and (path.startswith("/api/ai/") or
+            path.startswith("/api/work-plans") or path in ("/api/simulator", "/api/simulator-catalog")):
+        return jsonify({"error": "This feature is unavailable for factory-scoped accounts"}), 403
     if path.startswith("/api/users") or path.startswith("/api/ai/settings"):
         if user["role"] != "super_admin":
             return jsonify({"error": "Super admin access required"}), 403
@@ -138,7 +173,7 @@ def auth_login():
     if login_limited(key):
         return jsonify({"error": "Too many attempts. Try again in 15 minutes."}), 429
     with pg() as conn:
-        user = conn.execute("""SELECT id,username,role,enabled,session_version,password_hash
+        user = conn.execute("""SELECT id,username,role,factory_id,enabled,session_version,password_hash
             FROM app_users WHERE username=%s""", (username,)).fetchone()
         matches = password_matches(user["password_hash"] if user else None, password)
         if not user or not user["enabled"] or not matches:
@@ -182,9 +217,10 @@ def auth_change_password():
 @app.get("/api/users")
 def users_get():
     with pg() as conn:
-        rows = conn.execute("""SELECT id,username,role,enabled,created_at,last_login_at
+        rows = conn.execute("""SELECT id,username,role,factory_id,enabled,created_at,last_login_at
             FROM app_users ORDER BY id""").fetchall()
-    return jsonify({"users": rows, "roles": ROLES})
+        factories = conn.execute("SELECT id,name FROM factories ORDER BY name").fetchall()
+    return jsonify({"users": rows, "roles": ROLES, "factories": factories})
 
 
 @app.post("/api/users")
@@ -197,22 +233,30 @@ def users_create():
         role = body.get("role", "viewer")
         if role not in ROLES:
             raise ValueError("Unknown role")
+        factory_id = body.get("factory_id")
+        if role == "factory_admin":
+            if not isinstance(factory_id, int) or factory_id < 1:
+                raise ValueError("Factory-scoped admin requires a factory")
+        elif factory_id is not None:
+            raise ValueError("Only factory-scoped admins can have a factory")
         hashed = password_hash(body.get("password"))
         with pg() as conn:
-            row = conn.execute("""INSERT INTO app_users (username,password_hash,role)
-                VALUES (%s,%s,%s) RETURNING id""", (username, hashed, role)).fetchone()
+            if factory_id is not None and not conn.execute("SELECT 1 FROM factories WHERE id=%s", (factory_id,)).fetchone():
+                raise ValueError("Factory not found")
+            row = conn.execute("""INSERT INTO app_users (username,password_hash,role,factory_id)
+                VALUES (%s,%s,%s,%s) RETURNING id""", (username, hashed, role, factory_id)).fetchone()
     except UniqueViolation:
         return jsonify({"error": "Username already exists"}), 409
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
-    return jsonify({"id": row["id"], "username": username, "role": role}), 201
+    return jsonify({"id": row["id"], "username": username, "role": role, "factory_id": factory_id}), 201
 
 
 @app.patch("/api/users/<int:user_id>")
 def users_update(user_id):
     body = request.get_json(silent=True) or {}
-    if not isinstance(body, dict) or not body or set(body) - {"role", "enabled", "password"}:
-        return jsonify({"error": "Send role, enabled, or password"}), 400
+    if not isinstance(body, dict) or not body or set(body) - {"role", "factory_id", "enabled", "password"}:
+        return jsonify({"error": "Send role, factory, enabled, or password"}), 400
     try:
         if "role" in body and body["role"] not in ROLES:
             raise ValueError("Unknown role")
@@ -223,20 +267,28 @@ def users_update(user_id):
         return jsonify({"error": str(error)}), 400
     with pg() as conn:
         conn.execute("LOCK TABLE app_users IN SHARE ROW EXCLUSIVE MODE")
-        user = conn.execute("SELECT id,role,enabled FROM app_users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
+        user = conn.execute("SELECT id,role,factory_id,enabled FROM app_users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
         if not user:
             return jsonify({"error": "User not found"}), 404
         next_role, next_enabled = body.get("role", user["role"]), body.get("enabled", user["enabled"])
+        next_factory = body.get("factory_id", user["factory_id"])
+        if next_role == "factory_admin":
+            if not isinstance(next_factory, int) or next_factory < 1 or not conn.execute("SELECT 1 FROM factories WHERE id=%s", (next_factory,)).fetchone():
+                return jsonify({"error": "Factory-scoped admin requires an existing factory"}), 400
+        elif "factory_id" in body and next_factory is not None:
+            return jsonify({"error": "Only factory-scoped admins can have a factory"}), 400
+        else:
+            next_factory = None
         if user_id == g.user["id"] and (next_role != user["role"] or not next_enabled):
             return jsonify({"error": "You cannot demote or disable your own account"}), 400
         if user["role"] == "super_admin" and user["enabled"] and (next_role != "super_admin" or not next_enabled):
             count = conn.execute("SELECT count(*) AS n FROM app_users WHERE role='super_admin' AND enabled").fetchone()["n"]
             if count <= 1:
                 return jsonify({"error": "At least one enabled super admin is required"}), 400
-        result = conn.execute("""UPDATE app_users SET role=%s,enabled=%s,
+        result = conn.execute("""UPDATE app_users SET role=%s,factory_id=%s,enabled=%s,
             password_hash=COALESCE(%s,password_hash),session_version=session_version+1,
             updated_at=now() WHERE id=%s RETURNING session_version""",
-            (next_role, next_enabled, hashed, user_id)).fetchone()
+            (next_role, next_factory, next_enabled, hashed, user_id)).fetchone()
     if user_id == g.user["id"]:
         session["session_version"] = result["session_version"]
     return jsonify({"ok": True})
@@ -381,7 +433,8 @@ CREATE TABLE IF NOT EXISTS app_users (
  id BIGSERIAL PRIMARY KEY,
  username TEXT NOT NULL UNIQUE,
  password_hash TEXT NOT NULL,
- role TEXT NOT NULL CHECK (role IN ('super_admin','admin','viewer')),
+ role TEXT NOT NULL CHECK (role IN ('super_admin','admin','factory_admin','viewer')),
+ factory_id INTEGER REFERENCES factories(id),
  enabled BOOLEAN NOT NULL DEFAULT true,
  session_version INTEGER NOT NULL DEFAULT 1,
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -468,6 +521,14 @@ LEGACY_SENSORS = [
 def init_storage():
     with pg() as conn:
         conn.execute(SCHEMA)
+        conn.execute("ALTER TABLE app_users ADD COLUMN IF NOT EXISTS factory_id INTEGER REFERENCES factories(id)")
+        conn.execute("ALTER TABLE app_users DROP CONSTRAINT IF EXISTS app_users_role_check")
+        conn.execute("""ALTER TABLE app_users ADD CONSTRAINT app_users_role_check
+            CHECK (role IN ('super_admin','admin','factory_admin','viewer'))""")
+        conn.execute("ALTER TABLE app_users DROP CONSTRAINT IF EXISTS app_users_factory_scope_check")
+        conn.execute("""ALTER TABLE app_users ADD CONSTRAINT app_users_factory_scope_check
+            CHECK ((role='factory_admin' AND factory_id IS NOT NULL) OR
+                   (role<>'factory_admin' AND factory_id IS NULL))""")
         conn.execute("ALTER TABLE sensors ADD COLUMN IF NOT EXISTS meter_role TEXT NOT NULL DEFAULT 'consumption'")
         conn.execute("ALTER TABLE machines ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true")
         conn.execute("ALTER TABLE metering_alerts ADD COLUMN IF NOT EXISTS alert_type TEXT NOT NULL DEFAULT 'baseline'")
@@ -562,11 +623,11 @@ def ensure_seed_sensors(conn):
 
 def master_data():
     with pg() as conn:
-        return {
+        data = {
             "factories": conn.execute("SELECT * FROM factories ORDER BY id").fetchall(),
             "locations": conn.execute("""SELECT l.*, f.name AS factory_name FROM locations l
                 JOIN factories f ON f.id=l.factory_id ORDER BY l.id""").fetchall(),
-            "production_lines": conn.execute("""SELECT p.*, l.name AS location_name, f.name AS factory_name FROM production_lines p
+            "production_lines": conn.execute("""SELECT p.*, l.factory_id, l.name AS location_name, f.name AS factory_name FROM production_lines p
                 JOIN locations l ON l.id=p.location_id JOIN factories f ON f.id=l.factory_id ORDER BY p.id""").fetchall(),
             "machines": conn.execute("""SELECT m.*, p.location_id, l.factory_id, p.name AS production_line_name, l.name AS location_name,
                 f.name AS factory_name,
@@ -576,7 +637,7 @@ def master_data():
                     FROM machine_flow_links fl WHERE fl.left_machine_id=m.id), ARRAY[]::INTEGER[]) AS right_machine_ids
                 FROM machines m JOIN production_lines p ON p.id=m.production_line_id
                 JOIN locations l ON l.id=p.location_id JOIN factories f ON f.id=l.factory_id ORDER BY m.stage,m.lane,m.id""").fetchall(),
-            "sensors": conn.execute("""SELECT s.*, m.name AS machine_name, m.code AS machine_code,
+            "sensors": conn.execute("""SELECT s.*, l.factory_id, m.name AS machine_name, m.code AS machine_code,
                 p.name AS production_line_name, l.name AS location_name, f.name AS factory_name
                 FROM sensors s JOIN machines m ON m.id=s.machine_id
                 JOIN production_lines p ON p.id=m.production_line_id
@@ -584,20 +645,41 @@ def master_data():
                 ORDER BY s.type,s.id""").fetchall(),
             "simulator_running": conn.execute("SELECT value FROM app_settings WHERE key='simulator_running'").fetchone()["value"] == "true",
         }
+    boundary = scoped_factory_id()
+    if boundary is not None:
+        for table in ("factories", "locations", "production_lines", "machines", "sensors"):
+            key = "id" if table == "factories" else "factory_id"
+            data[table] = [row for row in data[table] if row[key] == boundary]
+        machine_ids = {row["id"] for row in data["machines"]}
+        for machine in data["machines"]:
+            machine["left_machine_ids"] = [mid for mid in machine["left_machine_ids"] if mid in machine_ids]
+            machine["right_machine_ids"] = [mid for mid in machine["right_machine_ids"] if mid in machine_ids]
+    return data
 
 
-def latest_readings():
+def latest_readings(sensor_ids=None):
     with CH_LOCK:
-        rows = ch().query("""SELECT sensor_id, argMax(value, observed_at) AS latest_value,
-            max(observed_at) AS latest_at FROM telemetry GROUP BY sensor_id""").result_rows
-        count = ch().query("SELECT count() FROM telemetry").first_row[0]
+        if sensor_ids is None:
+            rows = ch().query("""SELECT sensor_id, argMax(value, observed_at) AS latest_value,
+                max(observed_at) AS latest_at FROM telemetry GROUP BY sensor_id""").result_rows
+            count = ch().query("SELECT count() FROM telemetry").first_row[0]
+        elif sensor_ids:
+            params = {"ids": sensor_ids}
+            rows = ch().query("""SELECT sensor_id, argMax(value, observed_at) AS latest_value,
+                max(observed_at) AS latest_at FROM telemetry WHERE sensor_id IN {ids:Array(String)}
+                GROUP BY sensor_id""", parameters=params).result_rows
+            count = ch().query("SELECT count() FROM telemetry WHERE sensor_id IN {ids:Array(String)}",
+                               parameters=params).first_row[0]
+        else:
+            rows, count = [], 0
     return {sensor_id: {"value": value, "observed_at": observed_at.isoformat() + "Z" if observed_at.tzinfo is None else observed_at.isoformat()}
             for sensor_id, value, observed_at in rows}, count
 
 
 def overview_data():
     data = master_data()
-    latest, count = latest_readings()
+    boundary = scoped_factory_id()
+    latest, count = latest_readings([sensor["id"] for sensor in data["sensors"]] if boundary is not None else None)
     now = datetime.now(timezone.utc)
     with pg() as conn:
         profiles = load_profiles(conn, [sensor["id"] for sensor in data["sensors"]], [now])
@@ -617,9 +699,12 @@ def overview_data():
         machine["sensors"] = linked
         machine["status"] = "live" if machine["enabled"] and any(s["status"] == "live" for s in linked) else "off"
     with pg() as conn:
-        data["metering_alert_count"] = conn.execute(
-            "SELECT count(*) AS n FROM metering_alerts WHERE resolved_at IS NULL AND review_status IS NULL"
-        ).fetchone()["n"]
+        data["metering_alert_count"] = conn.execute("""SELECT count(*) AS n FROM metering_alerts a
+            LEFT JOIN sensors s ON s.id=a.sensor_id
+            JOIN machines m ON m.id=COALESCE(a.machine_id,s.machine_id)
+            JOIN production_lines p ON p.id=m.production_line_id JOIN locations l ON l.id=p.location_id
+            WHERE a.resolved_at IS NULL AND a.review_status IS NULL
+              AND (%s::integer IS NULL OR l.factory_id=%s)""", (boundary, boundary)).fetchone()["n"]
     data["telemetry_count"] = count
     data["ingest"] = dict(INGEST_STATUS)
     data["interval"] = SIM_INTERVAL
@@ -762,15 +847,21 @@ def dashboard():
 @app.get("/api/alerts")
 @app.get("/api/notifications")
 def alerts_get():
+    boundary = scoped_factory_id()
     with pg() as conn:
-        rows = conn.execute("""SELECT * FROM metering_alerts
-            ORDER BY (resolved_at IS NULL AND review_status IS NULL) DESC,
-            CASE WHEN alert_type='prolonged_maximum' THEN 0
-                 WHEN alert_type='maximum' THEN 1
-                 WHEN alert_type IN ('historical_high','historical_low') THEN 2 ELSE 3 END,
-            last_seen_at DESC LIMIT 200""").fetchall()
-        open_count = conn.execute("""SELECT count(*) AS n FROM metering_alerts
-            WHERE resolved_at IS NULL AND review_status IS NULL""").fetchone()["n"]
+        scope_sql = """FROM metering_alerts a LEFT JOIN sensors s ON s.id=a.sensor_id
+            JOIN machines m ON m.id=COALESCE(a.machine_id,s.machine_id)
+            JOIN production_lines p ON p.id=m.production_line_id
+            JOIN locations l ON l.id=p.location_id
+            WHERE (%s::integer IS NULL OR l.factory_id=%s)"""
+        rows = conn.execute("SELECT a.* " + scope_sql + """
+            ORDER BY (a.resolved_at IS NULL AND a.review_status IS NULL) DESC,
+            CASE WHEN a.alert_type='prolonged_maximum' THEN 0
+                 WHEN a.alert_type='maximum' THEN 1
+                 WHEN a.alert_type IN ('historical_high','historical_low') THEN 2 ELSE 3 END,
+            a.last_seen_at DESC LIMIT 200""", (boundary, boundary)).fetchall()
+        open_count = conn.execute("SELECT count(*) AS n " + scope_sql +
+            " AND a.resolved_at IS NULL AND a.review_status IS NULL", (boundary, boundary)).fetchone()["n"]
     response = jsonify({"alerts": rows, "open_count": open_count})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -788,8 +879,13 @@ def alert_action(alert_id):
     if len(note) > 1000:
         return jsonify({"error": "Resolution note is too long"}), 400
     with pg() as conn:
-        identity = conn.execute("SELECT machine_id FROM metering_alerts WHERE id=%s", (alert_id,)).fetchone()
+        identity = conn.execute("SELECT machine_id,sensor_id FROM metering_alerts WHERE id=%s", (alert_id,)).fetchone()
         if not identity:
+            return jsonify({"error": "Notification not found"}), 404
+        boundary = scoped_factory_id()
+        alert_factory = (machine_factory_id(conn, identity["machine_id"]) if identity["machine_id"]
+                         else record_factory_id(conn, "sensors", identity["sensor_id"]))
+        if boundary is not None and alert_factory != boundary:
             return jsonify({"error": "Notification not found"}), 404
         machine = None
         if identity["machine_id"]:
@@ -1059,6 +1155,11 @@ def report_data(kind):
     if factory_param and (not factory_param.isdigit() or int(factory_param) < 1):
         raise ValueError("Factory must be a positive ID")
     factory_id = int(factory_param) if factory_param else None
+    boundary = scoped_factory_id()
+    if boundary is not None:
+        if factory_id is not None and factory_id != boundary:
+            raise ValueError("Factory not found")
+        factory_id = boundary
     with pg() as conn:
         factory = conn.execute("SELECT id,name,code FROM factories WHERE id=%s", (factory_id,)).fetchone() if factory_id else None
         if factory_id and not factory:
@@ -1116,19 +1217,22 @@ def report_pdf(kind):
 
 @app.get("/api/category/<path:category>")
 def category_detail(category):
+    boundary = scoped_factory_id()
     with pg() as conn:
         meters = conn.execute("""SELECT s.*, m.name AS machine_name, m.code AS machine_code,
             l.name AS location_name FROM sensors s JOIN machines m ON m.id=s.machine_id
             JOIN production_lines p ON p.id=m.production_line_id
             JOIN locations l ON l.id=p.location_id
-            WHERE s.type=%s AND s.meter_role='consumption' ORDER BY m.name,s.name""",
-            (category,)).fetchall()
+            WHERE s.type=%s AND s.meter_role='consumption'
+              AND (%s::integer IS NULL OR l.factory_id=%s) ORDER BY m.name,s.name""",
+            (category, boundary, boundary)).fetchall()
         machine_rows = conn.execute("""SELECT m.id,m.name,m.code,m.enabled,l.name AS location_name
             FROM machines m JOIN production_lines p ON p.id=m.production_line_id
             JOIN locations l ON l.id=p.location_id
             WHERE EXISTS (SELECT 1 FROM sensors s WHERE s.machine_id=m.id
                 AND s.type=%s AND s.meter_role='consumption')
-            ORDER BY m.stage,m.lane,m.id""", (category,)).fetchall()
+              AND (%s::integer IS NULL OR l.factory_id=%s)
+            ORDER BY m.stage,m.lane,m.id""", (category, boundary, boundary)).fetchall()
     if not meters:
         return jsonify({"error": "Metering category not found"}), 404
     ids = [meter["id"] for meter in meters]
@@ -1182,8 +1286,12 @@ def category_detail(category):
 
 @app.get("/api/overview/trends")
 def overview_trends():
+    boundary = scoped_factory_id()
     with pg() as conn:
-        meters = conn.execute("SELECT id,type,enabled FROM sensors WHERE meter_role='consumption'").fetchall()
+        meters = conn.execute("""SELECT s.id,s.type,s.enabled FROM sensors s
+            JOIN machines m ON m.id=s.machine_id JOIN production_lines p ON p.id=m.production_line_id
+            JOIN locations l ON l.id=p.location_id WHERE s.meter_role='consumption'
+              AND (%s::integer IS NULL OR l.factory_id=%s)""", (boundary, boundary)).fetchall()
         now = datetime.now(timezone.utc)
         profiles = load_profiles(conn, [meter["id"] for meter in meters if meter["enabled"]], recent_minutes(now))
     types = {meter["id"]: meter["type"] for meter in meters}
@@ -1220,11 +1328,15 @@ def chart_trends():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     category_filter = request.args.get("category", "").strip()
+    boundary = scoped_factory_id()
     with pg() as conn:
-        meters = conn.execute("""SELECT id,type FROM sensors
-            WHERE enabled AND meter_role='consumption'
-              AND (%s='' OR type=%s) ORDER BY type,id""",
-            (category_filter, category_filter)).fetchall()
+        meters = conn.execute("""SELECT s.id,s.type FROM sensors s
+            JOIN machines m ON m.id=s.machine_id JOIN production_lines p ON p.id=m.production_line_id
+            JOIN locations l ON l.id=p.location_id
+            WHERE s.enabled AND s.meter_role='consumption'
+              AND (%s='' OR s.type=%s) AND (%s::integer IS NULL OR l.factory_id=%s)
+            ORDER BY s.type,s.id""",
+            (category_filter, category_filter, boundary, boundary)).fetchall()
         local_start = window["start"].astimezone(FACTORY_TIMEZONE)
         monday = local_start.date() - timedelta(days=local_start.weekday())
         profile_start = datetime.combine(monday, datetime.min.time(), FACTORY_TIMEZONE)
@@ -1275,6 +1387,9 @@ def machine_trend(machine_id):
     if not category:
         return jsonify({"error": "Metering category is required"}), 400
     with pg() as conn:
+        boundary = scoped_factory_id()
+        if boundary is not None and machine_factory_id(conn, machine_id) != boundary:
+            return jsonify({"error": "Machine not found"}), 404
         machine = conn.execute("SELECT id FROM machines WHERE id=%s", (machine_id,)).fetchone()
         if not machine:
             return jsonify({"error": "Machine not found"}), 404
@@ -1304,6 +1419,9 @@ def machine_trend(machine_id):
 @app.get("/api/machine/<int:machine_id>/metering-trends")
 def machine_metering_trends(machine_id):
     with pg() as conn:
+        boundary = scoped_factory_id()
+        if boundary is not None and machine_factory_id(conn, machine_id) != boundary:
+            return jsonify({"error": "Machine not found"}), 404
         machine = conn.execute("""SELECT m.id,m.name,m.code,m.enabled,l.name AS location_name
             FROM machines m JOIN production_lines p ON p.id=m.production_line_id
             JOIN locations l ON l.id=p.location_id WHERE m.id=%s""", (machine_id,)).fetchone()
@@ -1372,16 +1490,35 @@ def mutate(table):
     body = request.get_json(silent=True) or {}
     try:
         with pg() as conn:
+            boundary = scoped_factory_id()
             if request.method == "DELETE":
                 identity = str(body.get("id", ""))
                 if not identity:
                     raise ValueError("id is required")
+                if boundary is not None and not scoped_record_allowed(conn, table, identity):
+                    return jsonify({"error": "Record not found"}), 404
                 result = conn.execute(f"DELETE FROM {table} WHERE id=%s", (identity,))
                 if not result.rowcount:
                     return jsonify({"error": "Record not found"}), 404
                 return jsonify({"ok": True})
             creating = request.method == "POST"
             values = validated(table, body, creating)
+            if boundary is not None:
+                if creating and table == "factories":
+                    return jsonify({"error": "Only super admins can create factories"}), 403
+                if not creating:
+                    identity = str(body.get("id", ""))
+                    if not identity or not scoped_record_allowed(conn, table, identity):
+                        return jsonify({"error": "Record not found"}), 404
+                parent = {
+                    "locations": ("factories", "factory_id"),
+                    "production_lines": ("locations", "location_id"),
+                    "machines": ("production_lines", "production_line_id"),
+                    "sensors": ("machines", "machine_id"),
+                }.get(table)
+                if parent and (creating or parent[1] in values):
+                    if record_factory_id(conn, parent[0], values[parent[1]]) != boundary:
+                        return jsonify({"error": "Parent record is outside your factory"}), 403
             if creating:
                 names = list(values)
                 row = conn.execute(f"INSERT INTO {table} ({','.join(names)}) VALUES ({','.join(['%s'] * len(names))}) RETURNING id",
