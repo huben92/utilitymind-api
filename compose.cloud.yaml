@@ -72,6 +72,7 @@ services:
       SIMULATOR_BIND_HOST: 0.0.0.0
       SIMULATOR_MQTT_HOST: mqtt
       SIMULATOR_MQTT_PORT: "1883"
+      SIMULATOR_BATCH_MQTT: "1"
       SIMULATOR_SERVICE_KEY_FILE: /workspace/api/data/simulator_service.key
       SENSOR_DB: /workspace/simulator/data/sensors.sqlite3
     volumes:

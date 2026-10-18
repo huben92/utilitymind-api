@@ -1594,41 +1594,55 @@ def evaluate_machine_conditions(conn, machine, received):
 def on_message(client, userdata, message):
     try:
         payload = json.loads(message.payload)
-        sensor_id = str(payload["sensor_id"])
-        value = float(payload["value"])
-        if not math.isfinite(value):
-            raise ValueError("Metering reading must be finite")
+        readings = payload.get("readings") if isinstance(payload, dict) else None
+        readings = readings if isinstance(readings, list) else [payload]
+        if not 1 <= len(readings) <= 500:
+            raise ValueError("Invalid metering batch size")
+        sensor_ids = [str(item["sensor_id"]) for item in readings]
         with pg() as conn:
-            sensor = conn.execute("""SELECT s.id,s.machine_id,s.name,s.type,s.unit,s.baseline,s.max_value,s.enabled,
+            sensors = conn.execute("""SELECT s.id,s.machine_id,s.name,s.type,s.unit,s.baseline,s.max_value,s.enabled,
                 m.name AS machine_name,l.name AS location_name
                 FROM sensors s JOIN machines m ON m.id=s.machine_id
                 JOIN production_lines p ON p.id=m.production_line_id
                 JOIN locations l ON l.id=p.location_id
-                WHERE s.id=%s""", (sensor_id,)).fetchone()
-        if not sensor:
-            return
-        observed = datetime.fromisoformat(str(payload["timestamp"]).replace("Z", "+00:00"))
-        if observed.tzinfo is None:
-            observed = observed.replace(tzinfo=timezone.utc)
+                WHERE s.id = ANY(%s)""", (sensor_ids,)).fetchall()
+        catalog = {sensor["id"]: sensor for sensor in sensors}
         received = datetime.now(timezone.utc)
+        valid = []
+        for item in readings:
+            sensor_id = str(item["sensor_id"])
+            sensor = catalog.get(sensor_id)
+            if not sensor:
+                continue
+            value = float(item["value"])
+            if not math.isfinite(value):
+                raise ValueError("Metering reading must be finite")
+            observed = datetime.fromisoformat(str(item["timestamp"]).replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            valid.append((sensor, value, observed, bool(item.get("simulated", False))))
+        if not valid:
+            return
         with CH_LOCK:
-            ch().insert("telemetry", [[str(uuid.uuid4()), sensor_id, value, sensor["unit"], observed,
-                                       received, message.topic, bool(payload.get("simulated", False))]],
+            ch().insert("telemetry", [[str(uuid.uuid4()), sensor["id"], value, sensor["unit"], observed,
+                                       received, message.topic, simulated]
+                                      for sensor, value, observed, simulated in valid],
                         column_names=["event_id", "sensor_id", "value", "unit", "observed_at", "received_at", "topic", "simulated"])
         with pg() as conn:
-            machine = conn.execute("""SELECT m.id,m.name,m.enabled,l.name AS location_name
-                FROM machines m JOIN production_lines p ON p.id=m.production_line_id
-                JOIN locations l ON l.id=p.location_id WHERE m.id=%s FOR UPDATE OF m""",
-                (sensor["machine_id"],)).fetchone()
-            if sensor["enabled"] and machine:
-                record_metering_alerts(conn, sensor, value, observed, received)
-                if timedelta(0) <= received - observed <= timedelta(minutes=2):
-                    profiles = load_profiles(conn, [sensor_id], [observed])
-                    record_historical_deviation(conn, sensor, value, observed, received,
-                                                reading_profile(profiles, sensor_id, observed))
-                state = update_condition_state(conn, sensor, value, received)
-                record_prolonged_maximum(conn, sensor, value, observed, received, state["maximum_since"])
-                evaluate_machine_conditions(conn, machine, received)
+            for sensor, value, observed, _ in valid:
+                machine = conn.execute("""SELECT m.id,m.name,m.enabled,l.name AS location_name
+                    FROM machines m JOIN production_lines p ON p.id=m.production_line_id
+                    JOIN locations l ON l.id=p.location_id WHERE m.id=%s FOR UPDATE OF m""",
+                    (sensor["machine_id"],)).fetchone()
+                if sensor["enabled"] and machine:
+                    record_metering_alerts(conn, sensor, value, observed, received)
+                    if timedelta(0) <= received - observed <= timedelta(minutes=2):
+                        profiles = load_profiles(conn, [sensor["id"]], [observed])
+                        record_historical_deviation(conn, sensor, value, observed, received,
+                                                    reading_profile(profiles, sensor["id"], observed))
+                    state = update_condition_state(conn, sensor, value, received)
+                    record_prolonged_maximum(conn, sensor, value, observed, received, state["maximum_since"])
+                    evaluate_machine_conditions(conn, machine, received)
         INGEST_STATUS["last_message"] = received.isoformat()
         INGEST_STATUS["error"] = None
     except Exception as exc:
