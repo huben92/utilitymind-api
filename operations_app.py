@@ -52,6 +52,7 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "factory/#")
 SIM_INTERVAL = max(2, int(os.getenv("SIM_INTERVAL", "5")))
 CH_LOCK = threading.Lock()
 CH_CLIENT = None
+READING_COUNT_CACHE = {}
 INGEST_STATUS = {"connected": False, "last_message": None, "error": None}
 
 
@@ -657,21 +658,27 @@ def master_data():
     return data
 
 
-def latest_readings(sensor_ids=None):
+def latest_readings(sensor_ids, count_all=False):
     with CH_LOCK:
-        if sensor_ids is None:
-            rows = ch().query("""SELECT sensor_id, argMax(value, observed_at) AS latest_value,
-                max(observed_at) AS latest_at FROM telemetry GROUP BY sensor_id""").result_rows
-            count = ch().query("SELECT count() FROM telemetry").first_row[0]
-        elif sensor_ids:
+        if sensor_ids:
             params = {"ids": sensor_ids}
             rows = ch().query("""SELECT sensor_id, argMax(value, observed_at) AS latest_value,
                 max(observed_at) AS latest_at FROM telemetry WHERE sensor_id IN {ids:Array(String)}
+                AND observed_at >= now() - INTERVAL 1 MINUTE
                 GROUP BY sensor_id""", parameters=params).result_rows
-            count = ch().query("SELECT count() FROM telemetry WHERE sensor_id IN {ids:Array(String)}",
-                               parameters=params).first_row[0]
         else:
-            rows, count = [], 0
+            rows = []
+        cache_key = None if count_all else tuple(sensor_ids)
+        cached = READING_COUNT_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached[0] < 60:
+            count = cached[1]
+        elif count_all or sensor_ids:
+            count = ch().query("SELECT count() FROM telemetry" if count_all else
+                               "SELECT count() FROM telemetry WHERE sensor_id IN {ids:Array(String)}",
+                               parameters=None if count_all else {"ids": sensor_ids}).first_row[0]
+            READING_COUNT_CACHE[cache_key] = (time.monotonic(), count)
+        else:
+            count = 0
     return {sensor_id: {"value": value, "observed_at": observed_at.isoformat() + "Z" if observed_at.tzinfo is None else observed_at.isoformat()}
             for sensor_id, value, observed_at in rows}, count
 
@@ -679,7 +686,7 @@ def latest_readings(sensor_ids=None):
 def overview_data():
     data = master_data()
     boundary = scoped_factory_id()
-    latest, count = latest_readings([sensor["id"] for sensor in data["sensors"]] if boundary is not None else None)
+    latest, count = latest_readings([sensor["id"] for sensor in data["sensors"]], count_all=boundary is None)
     now = datetime.now(timezone.utc)
     with pg() as conn:
         profiles = load_profiles(conn, [sensor["id"] for sensor in data["sensors"]], [now])
@@ -1239,7 +1246,8 @@ def category_detail(category):
     parameters = {"ids": ids}
     with CH_LOCK:
         latest_rows = ch().query("""SELECT sensor_id, argMax(value, observed_at), max(observed_at)
-            FROM telemetry WHERE sensor_id IN {ids:Array(String)} GROUP BY sensor_id""",
+            FROM telemetry WHERE sensor_id IN {ids:Array(String)}
+            AND observed_at >= now() - INTERVAL 1 MINUTE GROUP BY sensor_id""",
             parameters=parameters).result_rows
         minute_rows = ch().query("""SELECT toStartOfMinute(observed_at) AS minute, sensor_id, avg(value)
             FROM telemetry WHERE sensor_id IN {ids:Array(String)}
