@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wheelworks
+      POSTGRES_USER: wheelworks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wheelworks_local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wheelworks -d wheelworks"]
+      interval: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_DB: wheelworks
+      CLICKHOUSE_USER: wheelworks
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-wheelworks_local}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "127.0.0.1:8124:8123"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      retries: 20
+
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    volumes:
+      - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    ports:
+      - "127.0.0.1:1884:1883"
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://wheelworks:${POSTGRES_PASSWORD:-wheelworks_local}@postgres:5432/wheelworks
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: wheelworks
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-wheelworks_local}
+      MQTT_HOST: mqtt
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: factory/wheel-rim/#
+      SIM_INTERVAL: "5"
+      SIMULATOR_MODE: external
+      AI_KEY_FILE: /workspace/data/ai_settings.key
+    volumes:
+      - ./data:/workspace/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8765:8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  clickhouse_data:
