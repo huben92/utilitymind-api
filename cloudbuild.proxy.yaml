@@ -1,0 +1,13 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.proxy
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/utilitymind/proxy:${_TAG}
+      - .
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/utilitymind/proxy:${_TAG}
+options:
+  logging: CLOUD_LOGGING_ONLY

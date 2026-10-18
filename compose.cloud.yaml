@@ -48,6 +48,7 @@ services:
       MQTT_TOPIC: factory/wheel-rim/#
       SIMULATOR_MODE: external
       SESSION_COOKIE_SECURE: "1"
+      SESSION_COOKIE_NAME: __session
       AI_KEY_FILE: /workspace/data/ai_settings.key
     volumes:
       - ./data:/workspace/data

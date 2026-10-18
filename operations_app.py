@@ -39,7 +39,8 @@ SESSION_SECRET_FILE = os.getenv("SESSION_SECRET_FILE", "data/session_secret.key"
 SIMULATOR_SERVICE_KEY_FILE = os.getenv("SIMULATOR_SERVICE_KEY_FILE", "data/simulator_service.key")
 app.secret_key = secret_file(SESSION_SECRET_FILE)
 secret_file(SIMULATOR_SERVICE_KEY_FILE)
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+app.config.update(SESSION_COOKIE_NAME=os.getenv("SESSION_COOKIE_NAME", "session"),
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                   SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE") == "1",
                   PERMANENT_SESSION_LIFETIME=timedelta(hours=12))
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://wheelworks:wheelworks_local@localhost:5433/wheelworks")

@@ -6,7 +6,8 @@ and `/simulator/**` to the stateless `utilitymind-api` Cloud Run gateway in
 Engine VM at `10.90.0.2`. Docker Compose on that VM runs the Flask API and MQTT
 subscriber, PostgreSQL, ClickHouse, Mosquitto, and the simulator. The simulator
 UI requires an admin or super-admin login through the gateway. No database or
-MQTT port is publicly exposed.
+MQTT port is publicly exposed. Firebase Hosting forwards only the `__session`
+cookie to Cloud Run, so the cloud Compose file gives Flask's cookie that name.
 
 ## Pilot resources and costs
 
