@@ -17,7 +17,7 @@ SIMULATOR_BASE = os.environ["PRIVATE_SIMULATOR_URL"].rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_BODY = 1_000_000
 COPY_HEADERS = ("Cookie", "Content-Type", "X-CSRF-Token", "Authorization")
-RESPONSE_HEADERS = ("Content-Type", "Content-Disposition", "Set-Cookie", "Cache-Control")
+RESPONSE_HEADERS = ("Content-Type", "Content-Disposition", "Set-Cookie")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,6 +99,7 @@ class Handler(BaseHTTPRequestHandler):
                 for name in RESPONSE_HEADERS:
                     for value in upstream.headers.get_all(name, []):
                         self.send_header(name, value)
+                self.send_header("Cache-Control", "private, no-store")
                 self.send_header("Content-Length", str(len(content)))
                 self.end_headers()
                 if self.command != "HEAD":
