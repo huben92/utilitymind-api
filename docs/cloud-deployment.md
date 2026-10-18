@@ -15,8 +15,8 @@ Project: `utilitymind-wheelworks`. Region: `us-central1`. VM:
 `utilitymind-data-1`, `e2-medium`, 30 GB standard persistent boot disk. The VM
 has a private IP in `utilitymind-vpc` and an ephemeral external IPv4 address.
 Its firewall allows SSH only through Google Cloud IAP and app ports 8765/8766
-only from `10.90.0.0/24`. The pilot billing budget sends
-alerts at 50%, 80%, and 100% of its configured monthly amount. A budget is an alert, not
+only from `10.90.0.0/24`. The `UtilityMind pilot Rp700k` billing budget sends
+alerts at 50%, 80%, and 100% of Rp700,000 per month. A budget is an alert, not
 a hard spending cap. VM, disk, and IPv4 cost continue while the VM runs; Cloud
 Run, storage, build, egress, and taxes may add to the total.
 
